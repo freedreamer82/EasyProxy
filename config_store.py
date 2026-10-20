@@ -70,6 +70,10 @@ DEFAULT_CONFIG = {
     "proxy_test_timeout": 10,
     "proxy_test_concurrency": None,
     "log_level": "WARNING",
+    # Cross-extractor renewal of signed CDN tokens (services/proxy_token_refresh.py):
+    # re-extract before the URL expires (margin in seconds) and on 401/403/404/410.
+    "token_refresh_enabled": True,
+    "token_refresh_margin_sec": 30,
 }
 
 _lock = threading.RLock()

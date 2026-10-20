@@ -1,3 +1,4 @@
+import contextlib
 import re
 import aiohttp
 from urllib.parse import urljoin, urlparse, unquote
@@ -76,6 +77,46 @@ class HLSProxyDashMixin:
             f"key={_safe_endpoint(key_url)} source={source} extractor={extractor} "
             f"route={route} policy={policy}"
         )
+
+    async def _dash_renewed_segment_url(self, request, routing, segment_url, status, bypass_warp, forced_proxy):
+        """Return a renewed segment URL after an expired-token status, or None.
+
+        Uses the cross-extractor renewal state keyed by ``stream_key`` (sealed
+        in the DASH routing token). Only one renewal per request.
+        """
+        stream_key = routing.get("stream_key")
+        if not stream_key or not hasattr(self, "_renew_stream_tokens"):
+            return None
+        if not self._token_refresh_enabled() or not self._is_token_expiry_status(status, segment_url):
+            return None
+        if getattr(request, "_dash_token_renewed", False):
+            return None
+        request._dash_token_renewed = True
+        try:
+            remapped = self._apply_renewed_token(stream_key, segment_url)
+            if remapped == segment_url:
+                refreshed = await self._renew_stream_tokens(
+                    stream_key,
+                    "reactive",
+                    bypass_warp=bypass_warp,
+                    forced_proxy=forced_proxy,
+                    extractor_key=routing.get("extractor_key"),
+                    failed_url=segment_url,
+                )
+                if not refreshed:
+                    return None
+                remapped = self._apply_renewed_token(stream_key, segment_url)
+        except Exception as exc:
+            logger.debug("DASH token renewal failed: %s", exc)
+            return None
+        if remapped == segment_url:
+            return None
+        logger.info(
+            "🔄 [DASH expired] status=%s, retrying segment with renewed token (stream_key=%s)",
+            status,
+            stream_key[:8],
+        )
+        return remapped
 
     async def handle_dash_segment(self, request):
         """Proxy for native DASH segments with optional ClearKey decryption. Stateless."""
@@ -172,7 +213,22 @@ class HLSProxyDashMixin:
             elif is_init and init_range:
                 headers["Range"] = f"bytes={init_range}"
 
-            async with _session.get(segment_url, headers=headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            async with contextlib.AsyncExitStack() as _stack:
+                resp = await _stack.enter_async_context(
+                    _session.get(segment_url, headers=headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=30))
+                )
+                if resp.status not in [200, 206]:
+                    # Expired signed URL: renew the stream tokens once (shared
+                    # with the HLS relay) and retry this segment on the new base.
+                    _retry_url = await self._dash_renewed_segment_url(
+                        request, routing, segment_url, resp.status, bypass_warp, forced_proxy
+                    )
+                    if _retry_url:
+                        resp = await _stack.enter_async_context(
+                            _session.get(_retry_url, headers=headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=30))
+                        )
+                        if resp.status in [200, 206]:
+                            segment_url = _retry_url
                 if resp.status not in [200, 206]:
                     return web.Response(status=resp.status)
 

@@ -9,9 +9,11 @@ from services.proxy_manifest import HLSProxyManifestHandlerMixin
 from services.proxy_pages import HLSProxyPagesMixin
 from services.proxy_streaming import HLSProxyStreamingMixin
 from services.proxy_dual import HLSProxyDualMixin
+from services.proxy_token_refresh import HLSProxyTokenRefreshMixin
 
 class HLSProxy(
     HLSProxyDualMixin,
+    HLSProxyTokenRefreshMixin,
     HLSProxyCoreMixin,
     HLSProxyManifestHandlerMixin,
     HLSProxyExtractorHandlerMixin,
@@ -64,6 +66,9 @@ class HLSProxy(
         # stream_key -> (old_base_dir, new_base_dir, new_query_string_with_leading_question_mark)
         self._renewed_cdn_tokens: dict[str, tuple[str, str, str]] = {}
         self._renewed_cdn_token_atimes: dict[str, float] = {}
+        # Cross-extractor token tracking (deadlines, locks, stats): built
+        # lazily by HLSProxyTokenRefreshMixin._token_state().
+        self._token_refresh_state = None
         # Template/OpenAPI cache (read once, serve many)
         self._template_cache = {}
         self._openapi_text = None

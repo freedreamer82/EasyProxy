@@ -41,6 +41,7 @@ class <Name>Extractor(BaseExtractor):
 Notes:
 - Node runner (wasm/obfs) → copy `cinejoy.py`: `get_http_bridge_for_proxy(proxy)` + `env["<NAME>_PROXY"]`, use `self._apply_routing_kwargs(url, kwargs)` then `proxy = await self._resolve_proxy(url)`, still return the 3 fields above.
 - Stdlib/aiohttp for HTTP only. No new dependencies.
+- Token lifetime is handled by the proxy, not by the extractor (`services/proxy_token_refresh.py`): the signed `destination_url` is parsed for `expires=`/`exp=`/JWT/Akamai deadlines and re-extracted with `force_refresh=True` before it expires and on 401/403/404/410 upstream errors. If the URL carries no readable deadline but you know it, return the optional `"token_expires_at": <epoch seconds>` field in the result dict. Make sure `force_refresh=True` really bypasses any internal cache.
 - Optional, only if needed: `force_ipv4 = True` (IPv4-bound tokens / CDN behind CF, see `vavoo.py`), `REQUEST_TIMEOUT_TOTAL = 60+` (slow solvers; default 30 in `proxy_extractor.py`), `disable_ssl` / `captured_manifest(s)` in the return dict.
 
 ## 2. `extractors/registry_imports.py` — one table row

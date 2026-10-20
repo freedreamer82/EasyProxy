@@ -478,6 +478,40 @@ class HLSProxyManifestHandlerMixin:
                 # dal proxy scelto dall'estrattore.
                 SELECTED_PROXY_CONTEXT.set(selected_proxy)
 
+                # Cross-extractor token tracking (services/proxy_token_refresh.py).
+                # Relays of an already-extracted stream carry orig_url != target:
+                # they must not overwrite the master's record with a variant URL.
+                _relay_orig = request.query.get("orig_url")
+                if not _relay_orig or _relay_orig == target_url:
+                    try:
+                        _deadline = self._record_stream_token(
+                            stream_key,
+                            result,
+                            orig_url=_relay_orig or target_url,
+                            request_headers=combined_headers,
+                            bypass_warp=bypass_warp,
+                            forced_proxy=selected_proxy,
+                            force_direct=force_direct,
+                            extractor_key=extractor_key,
+                            host=forced_host,
+                        )
+                        if _deadline and not force_refresh and self._token_refresh_due(stream_key):
+                            _fresh = await self._renew_stream_tokens(
+                                stream_key,
+                                "proactive",
+                                extractor_key=extractor_key,
+                                host=forced_host,
+                            )
+                            if _fresh and _fresh.get("destination_url"):
+                                result = _fresh
+                                stream_url = result["destination_url"]
+                                stream_headers = result.get("request_headers", {})
+                                captured_manifest = result.get("captured_manifest")
+                                captured_manifests = result.get("captured_manifests") or {}
+                                force_disable_ssl = result.get("disable_ssl", force_disable_ssl)
+                    except Exception as _tr_exc:
+                        logger.debug("Token tracking skipped: %s", _tr_exc)
+
                 if selected_proxy:
                     logger.debug(f"🎯 Final selected proxy for manifest: {selected_proxy}")
 
@@ -541,8 +575,12 @@ class HLSProxyManifestHandlerMixin:
             if is_native_mpd:
                 proxy_base = get_public_base_url(request)
 
-                # Fetch original manifest if not already captured
-                if not captured_manifest:
+                # Fetch original manifest if not already captured. An expired
+                # token gets one cross-extractor renewal + retry (same policy as
+                # the HLS relay) before the upstream status is passed through.
+                _mpd_attempt = 0
+                while not captured_manifest:
+                    _mpd_attempt += 1
                     mpd_session, mpd_proxy_used = await self._get_proxy_session(
                         stream_url,
                         bypass_warp=bypass_warp,
@@ -552,6 +590,33 @@ class HLSProxyManifestHandlerMixin:
                     try:
                         async with mpd_session.get(stream_url, headers=stream_headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                             if resp.status != 200:
+                                if (
+                                    _mpd_attempt == 1
+                                    and stream_key
+                                    and self._token_refresh_enabled()
+                                    and self._is_token_expiry_status(resp.status, stream_url)
+                                ):
+                                    _fresh = await self._renew_stream_tokens(
+                                        stream_key,
+                                        "reactive",
+                                        orig_url=request.query.get("orig_url") or target_url,
+                                        request_headers=combined_headers,
+                                        bypass_warp=bypass_warp,
+                                        forced_proxy=selected_proxy,
+                                        force_direct=force_direct,
+                                        current_url=stream_url,
+                                        extractor_key=extractor_key,
+                                        failed_url=stream_url,
+                                    )
+                                    _fresh_url = (_fresh or {}).get("destination_url")
+                                    if _fresh_url and _fresh_url != stream_url:
+                                        logger.info(
+                                            "🔄 [MPD expired] token renewed, retrying manifest [%s]",
+                                            request_log_context(request, stream_url, route=safe_log_route(mpd_proxy_used)),
+                                        )
+                                        stream_url = _fresh_url
+                                        stream_headers = _fresh.get("request_headers") or stream_headers
+                                        continue
                                 logger.error(
                                     "❌ Failed to fetch original MPD: status=%s [%s]",
                                     resp.status,

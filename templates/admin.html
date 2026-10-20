@@ -563,6 +563,16 @@
                     <option value="CRITICAL">CRITICAL</option>
                 </select>
             </div>
+            <div class="row">
+                <label>Token Auto-Refresh</label>
+                <div id="token-refresh-toggle" class="toggle" onclick="toggleTokenRefresh()"></div>
+                <span id="token-refresh-label" class="badge badge-off">OFF</span>
+            </div>
+            <div class="row">
+                <label>Refresh Margin (sec)</label>
+                <input type="number" id="token-refresh-margin" value="30" min="5" max="300" onchange="saveField('token_refresh_margin_sec', Math.max(5, Math.min(300, parseInt(this.value) || 30)))">
+            </div>
+            <p class="help-text" id="token-refresh-stats" style="margin-top:2px">Renews signed CDN tokens of any extractor before they expire and on 401/403/404/410 upstream errors.</p>
         </div>
 
         <!-- Active Streams -->
@@ -833,6 +843,9 @@ async function loadConfig() {
         document.getElementById('proxy-test-timeout').value = config.proxy_test_timeout || 10;
         document.getElementById('proxy-test-concurrency').value = (config.proxy_test_concurrency != null ? config.proxy_test_concurrency : 30);
         document.getElementById('log-level').value = config.log_level || 'WARNING';
+        setToggle('token-refresh-toggle', config.token_refresh_enabled !== false);
+        document.getElementById('token-refresh-margin').value = config.token_refresh_margin_sec || 30;
+        renderTokenRefreshStats(config.token_refresh);
 
         // Update system resources
         if (config.system_stats) {
@@ -1220,6 +1233,28 @@ async function toggleDvr() {
     const newVal = !config.dvr_enabled;
     await saveField('dvr_enabled', newVal);
     setToggle('dvr-toggle', newVal);
+}
+
+async function toggleTokenRefresh() {
+    const newVal = !(config.token_refresh_enabled !== false);
+    await saveField('token_refresh_enabled', newVal);
+    setToggle('token-refresh-toggle', newVal);
+}
+
+function renderTokenRefreshStats(s) {
+    const el = document.getElementById('token-refresh-stats');
+    if (!el) return;
+    if (!s || typeof s !== 'object') {
+        el.textContent = 'Renews signed CDN tokens of any extractor before they expire and on 401/403/404/410 upstream errors.';
+        return;
+    }
+    let txt = 'Tracked streams: ' + (s.tracked_streams || 0)
+        + ' · expiring soon: ' + (s.expiring_soon || 0)
+        + ' · renewals: ' + (s.proactive || 0) + ' proactive / ' + (s.reactive || 0) + ' reactive'
+        + ' · unchanged: ' + (s.unchanged || 0)
+        + ' · failed: ' + (s.failed || 0);
+    if (s.last_error) txt += ' · last error: ' + s.last_error;
+    el.textContent = txt;
 }
 
 </script>

@@ -319,6 +319,41 @@ class HLSProxyExtractorHandlerMixin:
 
             logger.debug(f"Extractor Debug: Final bypass_warp for redirect: {bypass_warp}")
 
+            # Cross-extractor token tracking (services/proxy_token_refresh.py):
+            # remember how to re-run this extraction and when its signed URL
+            # expires. If the extractor served a cached URL that is already
+            # about to expire, refresh it now instead of handing the player a
+            # dying token.
+            try:
+                _deadline = self._record_stream_token(
+                    stream_key,
+                    result,
+                    orig_url=request.query.get("orig_url") or url,
+                    request_headers=dict(request.headers),
+                    bypass_warp=bypass_warp,
+                    forced_proxy=selected_proxy,
+                    force_direct=force_direct,
+                    extractor_key=extractor_key,
+                    host=host_param,
+                )
+                _forced_refresh = str(extractor_kwargs.get("force_refresh", "")).lower() in {"1", "true", "yes", "on"}
+                if _deadline and not _forced_refresh and self._token_refresh_due(stream_key):
+                    _fresh = await self._renew_stream_tokens(
+                        stream_key,
+                        "proactive",
+                        extractor_key=extractor_key,
+                        host=host_param,
+                    )
+                    if _fresh and _fresh.get("destination_url"):
+                        result = _fresh
+                        result_query_params = _protected_extractor_params(result)
+                        stream_url = result["destination_url"]
+                        stream_headers = result.get("request_headers", {})
+                        captured_manifest = result.get("captured_manifest")
+                        force_disable_ssl = result.get("disable_ssl", force_disable_ssl)
+            except Exception as _tr_exc:
+                logger.debug("Token tracking skipped: %s", _tr_exc)
+
             logger.info(
                 f"✅ Extraction success: {stream_url[:50]}... Endpoint: {mediaflow_endpoint}"
             )

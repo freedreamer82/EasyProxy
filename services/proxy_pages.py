@@ -621,6 +621,11 @@ class HLSProxyPagesMixin:
         config["available_extractors"] = self._get_available_extractors()
         config["system_stats"] = get_system_stats()
         config["active_streams"] = _shared.get_active_streams()
+        if hasattr(self, "_token_refresh_report"):
+            try:
+                config["token_refresh"] = self._token_refresh_report()
+            except Exception:
+                config["token_refresh"] = {}
         return web.json_response(config)
 
     def _get_available_extractors(self):
@@ -651,12 +656,21 @@ class HLSProxyPagesMixin:
             "max_recording_duration", "recordings_retention_days",
             "proxy_test_timeout", "proxy_test_concurrency",
             "log_level",
+            "token_refresh_enabled", "token_refresh_margin_sec",
         }
 
         updates = {}
         for key, value in data.items():
             if key in allowed_keys:
                 updates[key] = value
+        if "token_refresh_enabled" in updates:
+            updates["token_refresh_enabled"] = bool(updates["token_refresh_enabled"])
+        if "token_refresh_margin_sec" in updates:
+            try:
+                _margin = int(updates["token_refresh_margin_sec"])
+            except (TypeError, ValueError):
+                return web.Response(status=400, text="token_refresh_margin_sec must be an integer")
+            updates["token_refresh_margin_sec"] = max(5, min(300, _margin))
 
         if updates:
             config_store.update(updates)

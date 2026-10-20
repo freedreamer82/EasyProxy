@@ -528,6 +528,10 @@ class HLSProxyStreamingMixin:
         """Re-extract in the background before a signed segment URL expires."""
         if not stream_key:
             return
+        if self._token_state()["meta"].get(stream_key):
+            # Streams tracked by the cross-extractor renewal are renewed at
+            # manifest time (_schedule_proactive_renewal); no second extractor.
+            return
         expiry = self._segment_token_expiry(stream_url)
         now = time.time()
         if expiry is None or expiry <= now or expiry - now > _TOKEN_REFRESH_MARGIN_SECONDS:
@@ -554,11 +558,9 @@ class HLSProxyStreamingMixin:
         task.add_done_callback(_drop)
 
     def _store_cdn_token(self, stream_key, old_url, new_url, label) -> None:
-        old_base_dir = old_url.rsplit("/", 1)[0] + "/"
-        new_base_dir = new_url.rsplit("/", 1)[0] + "/"
-        new_qs = "?" + new_url.split("?", 1)[1] if "?" in new_url else ""
-        self._renewed_cdn_tokens[stream_key] = (old_base_dir, new_base_dir, new_qs)
-        self._renewed_cdn_token_atimes[stream_key] = time.time()
+        # Goes through the shared mapping (services/proxy_token_refresh.py) so
+        # aliases and query pairs of chained renewals stay consistent.
+        self._store_renewed_token(stream_key, old_url, new_url)
         logger.info("🔑 %s for stream_key=%s", label, stream_key[:8])
 
     async def _extract_refreshed(self, orig_url, headers, bypass_warp, forced_proxy):
@@ -982,26 +984,35 @@ class HLSProxyStreamingMixin:
         coalesce_future = None
 
         try:
-            # ✅ LIVE CDN TOKEN SUBSTITUTION: If the CDN token was refreshed via
-            # re-extract on 403, replace the old base URL with the new one so every
-            # subsequent segment gets a fresh token without re-extracting each time.
+            # ✅ LIVE CDN TOKEN SUBSTITUTION: if the CDN token was renewed (proactively
+            # or after an upstream error) rewrite the old base URL with the new one, so
+            # every subsequent segment/variant gets a fresh token without re-extracting.
             stream_key = stream_key or request.query.get("stream_key")
-            if stream_key and stream_key in getattr(self, '_renewed_cdn_tokens', {}):
-                old_b, new_b, new_q = self._renewed_cdn_tokens[stream_key]
-                if stream_url.startswith(old_b):
-                    seg_name = stream_url[len(old_b):].split("?", 1)[0]
-                    stream_url = new_b + seg_name + new_q
-                    self._renewed_cdn_token_atimes[stream_key] = time.time()
+            # What the player holds, before any token mapping: the playlist it
+            # gets back is written on this URL, see _restore_client_token.
+            client_stream_url = stream_url
+            stream_url = self._apply_renewed_token(stream_key, stream_url)
 
-            # Inline cleanup of stale tokens (backstop for cleanup cycle)
-            now_ = time.time()
-            stale_tok = [
-                k for k, t in getattr(self, '_renewed_cdn_token_atimes', {}).items()
-                if now_ - t > 300
-            ]
-            for k in stale_tok:
-                self._renewed_cdn_tokens.pop(k, None)
-                self._renewed_cdn_token_atimes.pop(k, None)
+            # ⏱️ PROACTIVE RENEWAL (cross-extractor): manifests close to the token
+            # deadline are re-extracted before upstream starts answering 403.
+            # In the background: the re-extraction (popcdn through the VPN,
+            # 10 to 20 s) used to hold THIS playlist response, and the player
+            # drained its buffer waiting for it - a 20 s freeze and a stall
+            # at every renewal (Eppolo TV, 2026-10-19 19:01 and 19:06). The
+            # current token is still good for the whole margin, so this
+            # request is served on it now and the mapping above picks the
+            # renewed one up on the next reload. Segments are never delayed.
+            if not is_hls_segment_request and self._token_refresh_due(stream_key):
+                self._schedule_proactive_renewal(
+                    stream_key,
+                    bypass_warp=bypass_warp,
+                    forced_proxy=forced_proxy,
+                    force_direct=force_direct,
+                    extractor_key=extractor_key or None,
+                )
+
+            # Inline cleanup of stale tokens/tracking state (backstop for cleanup cycle)
+            self._cleanup_token_refresh_state()
 
             # FCTV33: resolve smart link segment and ensure _s2 signature
             if ("_ctump=" in stream_url and "_ctuph=" in stream_url) or (extractor_key == "fctv33" and "_ver=" in stream_url and "_s2=" not in stream_url):
@@ -1489,9 +1500,12 @@ class HLSProxyStreamingMixin:
                 content_type = resp.headers.get("content-type", "").lower()
 
                 if resp.status not in [200, 206]:
-                    if resp.status == 403:
+                    # 403 is the classic "token expired"; with token auto-refresh
+                    # enabled 401/410/486/487 (and 404 on tokenized URLs) are
+                    # treated the same way, for every extractor.
+                    if self._is_token_expiry_status(resp.status, stream_url):
                         # 1. Quick retry if it's a transient CDN error (e.g. Varnish cache miss with Retry-After on TikTok/live CDNs)
-                        if is_hls_segment_request:
+                        if resp.status == 403 and is_hls_segment_request:
                             retry_after = resp.headers.get("Retry-After")
                             x_cache = resp.headers.get("X-Cache", "")
                             server_hdr = resp.headers.get("Server", "").lower()
@@ -1526,7 +1540,9 @@ class HLSProxyStreamingMixin:
                                     except Exception:
                                         pass
 
-                        rot_response = await retry_with_different_proxy()
+                        # Proxy rotation only makes sense for 403 (IP-bound token);
+                        # a 401/404/410 would just burn the proxy pool.
+                        rot_response = await retry_with_different_proxy() if resp.status == 403 else None
                         if rot_response:
                             return rot_response
                         # Last resort: re-extract to refresh signed CDN token (e.g. VidXgo, DLStreams)
@@ -1553,7 +1569,7 @@ class HLSProxyStreamingMixin:
                                 status=retry_result["status"],
                                 headers=retry_headers,
                             )
-                    if resp.status == 403 and ("manifest.m3u8" in request.path or "playlist" in request.path):
+                    if self._is_token_expiry_status(resp.status, stream_url) and ("manifest.m3u8" in request.path or "playlist" in request.path):
                         # Premium playlist tokens are short-lived and IP-bound:
                         # drop the cached one and retry once with a fresh token
                         # before paying for a full re-extraction.
@@ -1775,9 +1791,23 @@ class HLSProxyStreamingMixin:
 
                     disable_ssl = request.query.get("disable_ssl") == "1" or get_ssl_setting_for_url(str(resp.url))
 
+                    # A renewed token must not change the segment URLs the player
+                    # already knows. AVPlayer keys a live playlist on its URIs: when
+                    # every URI changed at once (same media sequence, new token in
+                    # the query) it stopped extending the seekable range until the
+                    # whole old window had rolled out - a 20 to 30 s freeze, a
+                    # stall and a few seconds replayed at every renewal (Eppolo TV,
+                    # 2026-10-19 20:38, 20:42, 20:47, 20:51). So the playlist is
+                    # handed back on the token the player came with; the segment
+                    # relay maps each URL forward on fetch (_apply_renewed_token).
+                    rewrite_base = str(resp.url)
+                    if client_stream_url and client_stream_url != stream_url:
+                        manifest_content, rewrite_base = self._restore_client_token(
+                            manifest_content, upstream_url=str(resp.url), client_url=client_stream_url, stream_key=stream_key
+                        )
                     rewritten = await ManifestRewriter.rewrite_manifest_urls(
                         manifest_content=manifest_content,
-                        base_url=str(resp.url),
+                        base_url=rewrite_base,
                         proxy_base=proxy_base,
                         stream_headers=headers,
                         original_channel_url=original_url,
@@ -2181,9 +2211,10 @@ class HLSProxyStreamingMixin:
     async def _reextract_and_retry_manifest(
         self, request, stream_url, headers, bypass_warp, forced_proxy, force_direct, disable_ssl, extractor_key, stream_key
     ):
-        """Re-extract the source on 403 when upstream manifest token has expired."""
+        """Re-extract the source when the upstream manifest token has expired."""
         orig_url = request.query.get("orig_url")
-        if not orig_url:
+        tracked = bool(stream_key and self._token_state()["meta"].get(stream_key))
+        if not orig_url and not tracked:
             return None
 
         # Prevent recursive re-extraction loop
@@ -2192,57 +2223,38 @@ class HLSProxyStreamingMixin:
         request._manifest_reextracted = True
 
         logger.info(
-            "🔄 [Manifest 403] Upstream manifest token expired, re-extracting %s",
-            orig_url,
+            "🔄 [Manifest expired] Upstream manifest token expired, re-extracting %s",
+            orig_url or stream_key,
         )
         try:
-            refreshed = await self._extract_refreshed(
-                orig_url, headers, bypass_warp, forced_proxy
+            # Single-flight, cross-extractor renewal (services/proxy_token_refresh.py):
+            # re-runs extract(force_refresh=True) and records old->new base mapping.
+            refreshed = await self._renew_stream_tokens(
+                stream_key,
+                "reactive",
+                orig_url=orig_url,
+                request_headers=headers,
+                bypass_warp=bypass_warp,
+                forced_proxy=forced_proxy,
+                force_direct=force_direct,
+                current_url=stream_url,
+                extractor_key=extractor_key,
+                failed_url=stream_url,
             )
             if not refreshed or not refreshed.get("destination_url"):
                 return None
 
-            new_stream_url = refreshed["destination_url"]
+            # Prefer the in-place rewrite (keeps variant playlists on their own
+            # path); fall back to the fresh master URL as the legacy code did.
+            new_stream_url = self._apply_renewed_token(stream_key, stream_url)
+            if new_stream_url == stream_url:
+                new_stream_url = refreshed["destination_url"]
             new_headers = refreshed.get("request_headers") or headers
             logger.info(
                 "✅ [Manifest Recovered] Re-extraction succeeded: %s -> %s",
                 stream_url[:60],
                 new_stream_url[:60],
             )
-
-            # Update live CDN token for stream_key so segments get the fresh token
-            if stream_key:
-                self._store_cdn_token(
-                    stream_key,
-                    stream_url,
-                    new_stream_url,
-                    "Updated CDN token via manifest refresh",
-                )
-
-            # Signed provider URLs (e.g. Vavoo) expire. Send the player to a
-            # fresh stable manifest URL so it stops retrying the expired one.
-            if "manifest.m3u8" in request.path and new_stream_url != stream_url:
-                query = {"d": new_stream_url}
-                for key, value in (new_headers or {}).items():
-                    query[f"h_{key}"] = str(value)
-                for name in (
-                    "api_password", "disable_ssl", "warp", "proxy", "direct",
-                ):
-                    value = request.query.get(name)
-                    if value:
-                        query[name] = value
-                if refreshed.get("disable_ssl") or (new_headers or {}).get("X-EasyProxy-Disable-SSL") == "1":
-                    query["disable_ssl"] = "1"
-                if extractor_key:
-                    query["extractor_key"] = extractor_key
-                if stream_key:
-                    query["stream_key"] = stream_key
-                query["orig_url"] = orig_url
-                logger.info("↪️ [Manifest Refresh] Redirecting to fresh stable URL")
-                return web.HTTPFound(
-                    f"{get_public_base_url(request)}/proxy/hls/manifest.m3u8?"
-                    f"{urllib.parse.urlencode(query)}"
-                )
 
             return await self._proxy_stream(
                 request,
@@ -2263,21 +2275,30 @@ class HLSProxyStreamingMixin:
     ):
         """Re-extract the source on 403 to refresh signed CDN tokens, then retry the segment."""
         orig_url = request.query.get("orig_url")
-        if not orig_url:
+        stream_key = request.query.get("stream_key")
+        tracked = bool(stream_key and self._token_state()["meta"].get(stream_key))
+        if not orig_url and not tracked:
             return None
 
         # Only attempt for HLS segment requests with an extractor source URL
         if not request.path.startswith("/proxy/hls/segment."):
             return None
 
-        try:
-            refreshed = await self._extract_refreshed(
-                orig_url, headers, bypass_warp, forced_proxy
-            )
-        except Exception as exc:
+        # Single-flight, cross-extractor renewal: parallel segment requests that
+        # fail together share one extraction (services/proxy_token_refresh.py).
+        refreshed = await self._renew_stream_tokens(
+            stream_key,
+            "reactive",
+            orig_url=orig_url,
+            request_headers=headers,
+            bypass_warp=bypass_warp,
+            forced_proxy=forced_proxy,
+            force_direct=force_direct,
+            failed_url=stream_url,
+        )
+        if not refreshed:
             logger.debug(
-                "Re-extract for segment 403 failed: %s [%s]",
-                exc,
+                "Re-extract for segment error failed [%s]",
                 request_log_context(request, stream_url, route=safe_log_route(forced_proxy)),
             )
             return None
@@ -2362,14 +2383,9 @@ class HLSProxyStreamingMixin:
 
                 # Save refreshed CDN base URL for this stream_key so subsequent
                 # segments use the new token without re-extracting each time.
-                stream_key = request.query.get("stream_key")
                 if stream_key:
-                    self._store_cdn_token(
-                        stream_key,
-                        stream_url,
-                        fresh_url,
-                        "CDN token saved; subsequent segments skip re-extract",
-                    )
+                    self._store_renewed_token(stream_key, stream_url, fresh_url)
+                    logger.info("🔑 CDN token saved for stream_key=%s — subsequent segments skip re-extract", stream_key[:8])
 
                 return web.Response(body=body, status=fr_resp.status, headers=rh)
         except Exception as exc:

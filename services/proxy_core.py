@@ -120,6 +120,13 @@ class HLSProxyCoreMixin:
                     self._renewed_cdn_token_atimes.pop(k, None)
                     logger.debug("🧹 Cleaned stale CDN token: %s", k[:8])
 
+                # 1b. Clean up token-refresh tracking state (deadlines, locks, aliases)
+                if hasattr(self, "_cleanup_token_refresh_state"):
+                    try:
+                        self._cleanup_token_refresh_state(now, force=True)
+                    except Exception as _tr_exc:
+                        logger.debug("Token refresh cleanup failed: %s", _tr_exc)
+
                 # 2. Clean up idle proxy sessions (>60s)
                 if hasattr(self, "_proxy_sessions") and hasattr(self, "_proxy_session_atimes"):
                     _warp_url = _shared.WARP_PROXY_URL

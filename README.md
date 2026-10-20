@@ -108,6 +108,8 @@ easyproxy-update
 
 Most configuration settings (including Cloudflare WARP, DVR, and Proxy settings) are now managed directly from the **Admin Panel** at `http://localhost:7860/admin`.
 
+**Token Auto-Refresh** (Admin Panel → Advanced, enabled by default): signed CDN URLs returned by any extractor are tracked per stream, re-extracted shortly before their `expires`/`exp`/JWT deadline (configurable margin, default 30 s) and renewed on 401/403/404/410 upstream errors. Renewals are single-flight per stream and the new token is applied in place to the segments the player already holds. Turn it off to fall back to the legacy behaviour (re-extract on 403 only).
+
 Only basic environment variables need to be set in your `.env` file or container settings:
 
 | Variable | Description | Default |
