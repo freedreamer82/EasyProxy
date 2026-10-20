@@ -138,10 +138,24 @@ class HLSProxyTokenRefreshMixin:
 
     # ---------------------------------------------------------------- statuses
     def _is_token_expiry_status(self, status: int, url: str = "") -> bool:
-        """403 always (legacy behaviour); the wider set only when enabled."""
+        """403 always (legacy behaviour); the wider set only when enabled.
+
+        A 404 counts as an expiry only while the token's deadline is unknown
+        or already past: live origins answer 404 for a segment that has just
+        left the window (bluetier does so every time its playlist slides), and
+        with a readable, still valid token that is a missing segment, not a
+        stale signature. Re-extracting on each of those would hit the source
+        page once per window slide.
+        """
         if not self._token_refresh_enabled():
             return status == 403
-        return is_expiry_status(status, url)
+        if not is_expiry_status(status, url):
+            return False
+        if int(status) == 404:
+            deadline = parse_token_expiry(url)
+            if deadline is not None and deadline > time.time():
+                return False
+        return True
 
     # --------------------------------------------------------------- tracking
     def _record_stream_token(
